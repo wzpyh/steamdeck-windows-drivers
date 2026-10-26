@@ -1,0 +1,8 @@
+*.sys
+*.sys.signed
+*.sys.original
+*.sys.pending
+*.cat
+*.log
+*.pyc
+__pycache__/
