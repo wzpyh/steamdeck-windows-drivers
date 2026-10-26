@@ -1,6 +1,15 @@
 # Steam Deck OLED Windows Driver Fixes
 
-Binary patches for two Valve-shipped drivers on the **Steam Deck OLED running Windows 11** that cause blue-screens (BSODs) after the Bluetooth adapter enters an unresponsive state.
+Binary patches for two Valve-shipped drivers on the **Steam Deck OLED running Windows 11** that cause blue-screens (BSODs) and kernel memory leaks.
+
+> **Which OLED do you have?** The Steam Deck OLED shipped with two different APU variants. Check Device Manager &rarr; Display adapters &rarr; Properties &rarr; Details &rarr; Hardware Ids:
+>
+> | Device ID | APU Codename | Notes |
+> |---|---|---|
+> | `DEV_163F` | **VanGogh** | Same as LCD. Third-party drivers (Ally2Deck, ASUS ROG) may work. |
+> | `DEV_1435` | **Sephiroth** | Valve-exclusive silicon. **No third-party driver supports this chip** &mdash; these patches are your only option. |
+>
+> The GPU patch targets Valve's driver (`amdkmdag.sys` 32.0.11002.3007) which supports both variants. The Bluetooth patch applies to all Steam Deck OLEDs regardless of APU variant.
 
 | Driver | Bug | BSOD | Patch |
 |---|---|---|---|
@@ -36,6 +45,16 @@ When anything triggers a D3 (power-off) transition on the dead adapter &mdash; s
 Valve's `amdkmdag.sys` registers three `PsSetCreateProcessNotifyRoutineEx` callbacks during initialization but **never unregisters them**, even when the callbacks are functionally dead. Each process exit leaks an `EPROCESS` reference (~0.78 KB/process). On a machine running browsers and Electron apps that spawn many short-lived processes, this accumulates over days.
 
 **Fix:** NOP all three `PsSetCreateProcessNotifyRoutineEx` call sites (RVA `0xDFE8E`, `0x11B036`, `0x61C47C`), replacing each 6-byte `call [IAT]` with `xor eax, eax; nop*4`. The callbacks were Valve's telemetry/debug hooks and are not required for GPU operation.
+
+## Why not just use a newer AMD driver?
+
+**Short answer:** if your OLED has the Sephiroth APU (`DEV_1435`), no other driver exists.
+
+Valve stopped updating their Windows drivers for the Steam Deck. Community projects like [Ally2Deck-v3](https://github.com/steminvader/Ally2Deck-v3) can patch ASUS ROG Ally drivers to work on the Deck — but only for the **VanGogh** variant (`DEV_163F`), because that's what the ROG Ally also uses.
+
+I tested Ally2Deck-v3 with the ASUS driver (V32.0.21045.11001) on my Sephiroth OLED after adding `DEV_1435` to `amdgcf.dat` and the INF files. The driver entry-point validation passed (PnP matched and loaded it), but `amdkmdag.sys` failed during initialization with **CM_PROB_FAILED_POST_START** (Code 10). The ASUS binary has no code paths for `DEV_1435` — the `cmp edi,1435h` instructions that exist in Valve's driver are completely absent. No amount of INF/whitelist patching can fix this; you'd have to patch the `.sys` binary itself, which defeats Ally2Deck's WHQL-preservation advantage.
+
+No other OEM (ASUS, Lenovo, AMD public) has ever shipped hardware with `DEV_1435`, so no OEM driver will ever support it. The binary patches in this repo are the only fix.
 
 ## Requirements
 
