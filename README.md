@@ -1,6 +1,6 @@
 # Steam Deck OLED Windows Driver Fixes
 
-Binary patches for two Valve-shipped drivers on the **Steam Deck OLED running Windows 11** that cause blue-screens (BSODs) and kernel memory leaks.
+Binary patches for drivers on the **Steam Deck OLED running Windows 11** that cause blue-screens, kernel memory leaks, or lack hardware support.
 
 > **Which OLED do you have?** The Steam Deck OLED shipped with two different APU variants. Check Device Manager &rarr; Display adapters &rarr; Properties &rarr; Details &rarr; Hardware Ids:
 >
@@ -9,15 +9,59 @@ Binary patches for two Valve-shipped drivers on the **Steam Deck OLED running Wi
 > | `DEV_163F` | **VanGogh** | Same as LCD. Third-party drivers (Ally2Deck, ASUS ROG) may work. |
 > | `DEV_1435` | **Sephiroth** | Valve-exclusive silicon. **No third-party driver supports this chip** &mdash; these patches are your only option. |
 >
-> The GPU patch targets Valve's driver (`amdkmdag.sys` 32.0.11002.3007) which supports both variants. The Bluetooth patch applies to all Steam Deck OLEDs regardless of APU variant.
+> The Bluetooth patch applies to all Steam Deck OLEDs regardless of APU variant.
 
-| Driver | Bug | BSOD | Patch |
-|---|---|---|---|
-| `qcbtuart.sys` 1.0.0.14 (Qualcomm QCA206x Bluetooth UART) | Infinite wait on dead adapter &rarr; nonpaged pool exhaustion | 0x10D after 9-18 h | 30 s timeout + I/O cancel + **automatic PnP device restart** |
-| `qcbtuart.sys` 1.0.0.14 | D3 power transition blocks on dead adapter | 0x9F (immediate) | NOP the blocking calls |
-| `amdkmdag.sys` 32.0.11002.3007 (Valve AMD GPU) | `PsSetCreateProcessNotifyRoutineEx` callbacks never unregistered &rarr; EPROCESS reference leak | Gradual memory exhaustion | NOP all 3 registration call sites |
+## What's in this repo
 
-All patches are applied by a Python script that reads the **original** `.sys` from Valve's driver package, verifies its SHA-256, writes the patched bytes, and outputs a new `.sys` ready for test-signing.
+| Directory | Driver | What it does |
+|---|---|---|
+| [`bluetooth/`](#the-bluetooth-problem) | `qcbtuart.sys` 1.0.0.14 | Fixes two BSOD paths (0x10D pool exhaustion + 0x9F power timeout) with self-healing PnP restart |
+| [`gpu/`](#the-gpu-problem) | `amdkmdag.sys` 32.0.11002.3007 (Valve) | NOPs leaked `PsSetCreateProcessNotifyRoutineEx` callbacks that exhaust nonpaged pool |
+| [`adrenalin/`](#adrenalin-on-sephiroth) | `amdkmdag.sys` from AMD Adrenalin | **Enables AMD Adrenalin drivers on the Sephiroth APU** &mdash; D3D12 FL 12_2, WDDM 3.2, H.264/HEVC encode |
+
+## Adrenalin on Sephiroth
+
+**The big one.** If your Steam Deck OLED has `DEV_1435` (Sephiroth), no AMD driver &mdash; not Valve's, not ASUS's, not any OEM's &mdash; has ever shipped with support for your hardware. Valve's driver caps you at D3D12 Feature Level 12_0 and WDDM 2.0. Community projects like Ally2Deck patch ASUS drivers for VanGogh (`DEV_163F`) but fail with Code 10 on Sephiroth because the binary has no code paths for `DEV_1435`.
+
+This patch changes that. It takes AMD's **Adrenalin 26.10.1** (`amdkmdag.sys` 32.0.21045.16010) and replaces 11 device-ID fields from VanGogh (`0x163F`) to Sephiroth (`0x1435`). That's it &mdash; 22 bytes changed, zero code modifications. The VanGogh initialization path works natively on Sephiroth hardware.
+
+### Result
+
+| | Valve OEM | Adrenalin 26.10.1 (patched) |
+|---|---|---|
+| D3D12 Feature Level | 12_0 | **12_2** |
+| WDDM | 2.0 | **3.2** |
+| H.264/HEVC Encode | No | **Yes** |
+| Adrenalin Software UI | No | **Yes** |
+| Driver Date | 2023 | **2026** |
+
+### How it works
+
+The patch auto-discovers all `0x0000163F` (VanGogh) DWORD entries in the binary and replaces them with `0x00001435` (Sephiroth), skipping false positives and PAGEDCIR hardware block IDs (which are internal register addresses, not device IDs). The result is that AMD's driver recognizes Sephiroth as a supported device and initializes it through the VanGogh code path, which is architecturally compatible.
+
+### Installation
+
+```powershell
+# 1. Download AMD Adrenalin 26.10.1 installer and extract amdkmdag.sys
+#    (Run the installer, it extracts to C:\AMD\... — find amdkmdag.sys in the extracted files)
+
+# 2. Copy it here and patch
+copy <path-to-extracted>\amdkmdag.sys adrenalin\amdkmdag.sys
+python adrenalin\patch.py
+
+# 3. Deploy (Admin PowerShell)
+.\adrenalin\deploy.ps1
+
+# 4. COLD BOOT — shut down fully, then power on
+#    Do NOT use Restart. Hot restart will BSOD.
+```
+
+### Limitations
+
+- **Cold boot required.** Hot restart (`pnputil /restart-device`, Windows Restart with fast startup) crashes with BSOD 0x7E due to stale adapter state in the display stack. Always shut down fully and power back on.
+- Requires Windows test signing mode (adds a "Test Mode" watermark).
+- Tested with Adrenalin 26.10.1 (32.0.21045.16010). Other versions should work if the device-ID structure is similar &mdash; the script auto-discovers patch locations.
+- Sleep/resume, hibernate, and GPU-intensive workloads are untested but expected to work (same silicon, same init path).
 
 ## The Bluetooth Problem
 
@@ -48,17 +92,17 @@ Valve's `amdkmdag.sys` registers three `PsSetCreateProcessNotifyRoutineEx` callb
 
 ## Why not just use a newer AMD driver?
 
-**Short answer:** if your OLED has the Sephiroth APU (`DEV_1435`), no other driver exists.
+**Short answer:** if your OLED has the Sephiroth APU (`DEV_1435`), no other driver exists &mdash; until now.
 
-Valve stopped updating their Windows drivers for the Steam Deck. Community projects like [Ally2Deck-v3](https://github.com/steminvader/Ally2Deck-v3) can patch ASUS ROG Ally drivers to work on the Deck — but only for the **VanGogh** variant (`DEV_163F`), because that's what the ROG Ally also uses.
+Valve stopped updating their Windows drivers for the Steam Deck. Community projects like [Ally2Deck-v3](https://github.com/steminvader/Ally2Deck-v3) can patch ASUS ROG Ally drivers to work on the Deck &mdash; but only for the **VanGogh** variant (`DEV_163F`), because that's what the ROG Ally also uses.
 
-I tested Ally2Deck-v3 with the ASUS driver (V32.0.21045.11001) on my Sephiroth OLED after adding `DEV_1435` to `amdgcf.dat` and the INF files. The driver entry-point validation passed (PnP matched and loaded it), but `amdkmdag.sys` failed during initialization with **CM_PROB_FAILED_POST_START** (Code 10). The ASUS binary has no code paths for `DEV_1435` — the `cmp edi,1435h` instructions that exist in Valve's driver are completely absent. No amount of INF/whitelist patching can fix this; you'd have to patch the `.sys` binary itself, which defeats Ally2Deck's WHQL-preservation advantage.
+I tested Ally2Deck-v3 with the ASUS driver on my Sephiroth OLED after adding `DEV_1435` to `amdgcf.dat` and the INF files. The driver loaded but failed during initialization with **CM_PROB_FAILED_POST_START** (Code 10). The ASUS binary has no code paths for `DEV_1435` &mdash; the `cmp edi,1435h` instructions that exist in Valve's driver are completely absent. No amount of INF/whitelist patching can fix this.
 
-No other OEM (ASUS, Lenovo, AMD public) has ever shipped hardware with `DEV_1435`, so no OEM driver will ever support it. The binary patches in this repo are the only fix.
+The Adrenalin patch in this repo solves this by going straight to AMD's own driver and teaching it about Sephiroth. The VanGogh init path is architecturally compatible, so a pure data patch &mdash; 11 device-ID fields, 22 bytes &mdash; is all it takes.
 
 ## Requirements
 
-- **Steam Deck OLED** running Windows 11 (other hardware will have different driver binaries)
+- **Steam Deck OLED** running Windows 11
 - Python 3.10+
 - Windows SDK (`signtool.exe`) for test-signing
 - Administrator access
@@ -77,12 +121,11 @@ This adds a "Test Mode" watermark to the desktop (cosmetic only).
 
 ### 2. Obtain the original drivers
 
-The patcher needs the **original unpatched** `.sys` files from Valve's driver package.
+Each patcher needs the **original unpatched** `.sys` file.
 
-- **Bluetooth:** `qcbtuart.sys` SHA-256: `f52ef4caca48ae59c61d18fcf3722308bc19d1c24c6605d4ba66c26ef78aa744`
-  - Usually at: `C:\Windows\System32\DriverStore\FileRepository\qcbtuart.inf_amd64_*\qcbtuart.sys`
-- **GPU:** `amdkmdag.sys` SHA-256: `0b446cba31e21e3d90d921919a180201c4b2ea76b064296f116508b984c79319`
-  - Usually at: `C:\Windows\System32\DriverStore\FileRepository\u0403558.inf_amd64_*\B403937\amdkmdag.sys`
+- **Bluetooth:** `qcbtuart.sys` &mdash; usually at `C:\Windows\System32\DriverStore\FileRepository\qcbtuart.inf_amd64_*\qcbtuart.sys`
+- **GPU (Valve):** `amdkmdag.sys` &mdash; usually at `C:\Windows\System32\DriverStore\FileRepository\u0403558.inf_amd64_*\B403937\amdkmdag.sys`
+- **Adrenalin:** `amdkmdag.sys` &mdash; extract from the AMD Adrenalin installer package
 
 ### 3. Patch
 
@@ -91,41 +134,61 @@ The patcher needs the **original unpatched** `.sys` files from Valve's driver pa
 copy <path-to-original>\qcbtuart.sys bluetooth\qcbtuart.sys
 python bluetooth\patch.py
 
-# GPU
+# GPU (Valve memory leak fix)
 copy <path-to-original>\amdkmdag.sys gpu\amdkmdag.sys
 python gpu\patch.py
-```
 
-Each script verifies the source hash, applies patches, and writes the patched `.sys` to the same directory.
+# Adrenalin (Sephiroth device-ID patch)
+copy <path-to-extracted>\amdkmdag.sys adrenalin\amdkmdag.sys
+python adrenalin\patch.py
+```
 
 ### 4. Sign and deploy
 
 ```powershell
-# Admin PowerShell — Bluetooth
+# Admin PowerShell
 .\bluetooth\deploy.ps1
-
-# Admin PowerShell — GPU
 .\gpu\deploy.ps1
+.\adrenalin\deploy.ps1
 ```
 
-The deploy scripts handle certificate creation, signing, backup of the original, and driver replacement. **Reboot** to activate.
+**Adrenalin requires a cold boot** (full shutdown + power on). The other patches activate on any reboot.
 
 ### 5. Verify
 
-- **Bluetooth:** After an adapter hang (BthMini Event ID 3), watch Device Manager &mdash; the Bluetooth adapter should disappear and reappear within ~40 seconds as PnP re-enumerates it. No BSOD.
-- **GPU:** Run `poolmon` or check Task Manager over several days &mdash; `Proc` tag allocations should show frees keeping pace with allocations.
+- **Bluetooth:** After an adapter hang (BthMini Event ID 3), the adapter should disappear and reappear in Device Manager within ~40 seconds. No BSOD.
+- **GPU:** `Proc` tag allocations in `poolmon` should show frees keeping pace with allocations.
+- **Adrenalin:** DxDiag should show Feature Level **12_2**, WDDM 3.2, and the Adrenalin driver version.
 
 ## Reverting
 
-Each directory contains a `revert.ps1` that restores the original driver from the backup created during deployment.
+Each directory contains a `revert.ps1` that restores the original driver.
 
 ```powershell
 # Admin PowerShell
-.\bluetooth\revert.ps1   # or .\gpu\revert.ps1
-# Reboot
+.\bluetooth\revert.ps1
+.\gpu\revert.ps1
+.\adrenalin\revert.ps1
+# Reboot (cold boot for Adrenalin)
 ```
 
 ## Technical Details
+
+### Adrenalin patch map (amdkmdag.sys 32.0.21045.16010)
+
+11 DWORD fields where `0x0000163F` (VanGogh) is replaced with `0x00001435` (Sephiroth):
+
+| Section | Count | Purpose |
+|---|---|---|
+| `.text` | 4 | Device classification comparisons |
+| `.rdata` | 2 | ASIC factory table entries (rev=AE, rev=AF) |
+| `.data` | 2 | Supported-device array + family-0x90 record |
+| `PAGEKMDD` | 1 | Device slot |
+| `PAGED3PR` | 2 | Display controller + parameter tables |
+
+The script auto-discovers these locations by scanning for `0x0000163F` DWORDs and filtering out:
+- **PAGEDCIR entries** (4&times;): internal hardware block IDs paired with `0x1620` &mdash; patching these would break register access
+- **Byte-aligned false positives**: coincidental byte patterns in float/string data
 
 ### Bluetooth patch map (qcbtuart.sys 1.0.0.14)
 
@@ -140,7 +203,7 @@ Each directory contains a `revert.ps1` that restores the original driver from th
 | Cave 2 | `0x29D82` | 20 B | Load WdfDeviceSetFailed function pointer |
 | Cave 3 | `0x29DA6` | 22 B | NULL check + call WdfDeviceSetFailed + return |
 
-The self-healing caves use **INT3 padding** between function stubs in the `.text` section (dead space inserted by the linker for alignment). No existing code is displaced.
+Self-healing caves use **INT3 padding** between function stubs in the `.text` section.
 
 ### GPU patch map (amdkmdag.sys 32.0.11002.3007)
 
@@ -152,9 +215,7 @@ The self-healing caves use **INT3 padding** between function stubs in the `.text
 
 ## Disclaimer
 
-These patches modify kernel-mode drivers. They were developed through reverse engineering of the specific driver versions shipped by Valve for the Steam Deck OLED. **Use at your own risk.** The authors are not responsible for any damage. Always keep backups of your original drivers.
-
-These patches are specific to the exact driver versions listed above. Different versions will have different hashes and the patcher will refuse to run.
+These patches modify kernel-mode drivers. They were developed through reverse engineering of the specific driver versions shipped by Valve and AMD for the Steam Deck OLED. **Use at your own risk.** The authors are not responsible for any damage. Always keep backups of your original drivers.
 
 ## License
 
